@@ -1,6 +1,7 @@
 import config from "../vendor/dx7-synth-js/config";
 import Synth from "../vendor/dx7-synth-js/synth";
 import FMVoice from "../vendor/dx7-synth-js/voice-dx7";
+import { dx7PackedVoices } from "./dx7PackedVoices";
 
 type Dx7Synth = {
   noteOn: (note: number, velocity: number) => void;
@@ -57,15 +58,13 @@ export class Dx7RackEngine {
   readonly output: GainNode;
   private readonly processor: ScriptProcessorNode;
   private readonly synth: Dx7Synth;
-  private readonly variant: "dx-stack" | "cartridge-fm";
   private params: Dx7Params;
 
-  constructor(context: AudioContext, parameters: Record<string, number>, variant: "dx-stack" | "cartridge-fm") {
+  constructor(context: AudioContext, parameters: Record<string, number>) {
     config.sampleRate = context.sampleRate;
-    this.variant = variant;
     this.output = context.createGain();
     this.output.gain.value = 0.85;
-    this.synth = new SynthCtor(FMVoice, variant === "dx-stack" ? 12 : 10);
+    this.synth = new SynthCtor(FMVoice, 12);
     this.processor = context.createScriptProcessor(config.bufferSize, 0, 2);
     this.processor.onaudioprocess = (event) => {
       const left = event.outputBuffer.getChannelData(0);
@@ -88,7 +87,7 @@ export class Dx7RackEngine {
 
   noteOn(note: number, velocity: number) {
     this.synth.noteOn(note, Math.max(0.05, Math.min(1.25, velocity)));
-    window.dispatchEvent(new CustomEvent("rack25-audio-start", { detail: { engine: this.variant, note } }));
+    window.dispatchEvent(new CustomEvent("rack25-audio-start", { detail: { engine: "dx-stack", note } }));
   }
 
   noteOff(note: number) {
@@ -106,7 +105,10 @@ export class Dx7RackEngine {
   }
 
   private createParams(p: Record<string, number>): Dx7Params {
-    const algorithm = Math.max(1, Math.min(32, Math.round((p.algorithm ?? 1) * 8 + 1)));
+    const packedVoice = this.getPackedVoice(p);
+    if (packedVoice) return this.createParamsFromPackedVoice(p, packedVoice);
+
+    const algorithm = Math.max(1, Math.min(32, Math.round(p.algorithm ?? 1)));
     const feedback = Math.max(0, Math.min(7, Math.round((p.feedback ?? 0.2) * 7)));
     const tone = Math.max(0, Math.min(1, ((p.cutoff ?? 2400) - 80) / (9000 - 80)));
     const index = p.index ?? p.bite ?? 0.35;
@@ -137,7 +139,7 @@ export class Dx7RackEngine {
       lfoPitchModDepth: Math.round((p.motion ?? 0.25) * 28),
       lfoAmpModDepth: Math.round((p.motion ?? 0.25) * 18),
       lfoPitchModSens: 3,
-      lfoWaveform: this.variant === "cartridge-fm" ? 4 : 0,
+      lfoWaveform: 0,
       lfoSync: 0,
       pitchEnvelope: { rates: [0, 0, 0, 0], levels: [50, 50, 50, 50] },
       controllerModVal: 0,
@@ -172,9 +174,6 @@ export class Dx7RackEngine {
   }
 
   private operatorRatios(ratio: number, shape: number) {
-    if (this.variant === "cartridge-fm") {
-      return [1, ratio, ratio * 1.5 + shape, 0.5 + shape, ratio * 2, ratio * 4 + 0.01];
-    }
     return [1, ratio, 1 + shape * 3, ratio * 0.5 + 0.5, ratio * 2 + shape, ratio * 3 + 0.01];
   }
 
@@ -190,5 +189,70 @@ export class Dx7RackEngine {
 
   private levelToDx(value: number) {
     return Math.max(0, Math.min(99, Math.round(value)));
+  }
+
+  private getPackedVoice(p: Record<string, number>) {
+    const patchIndex = Math.round(p.dx7PatchIndex ?? -1);
+    if (patchIndex >= 0 && patchIndex < dx7PackedVoices.length) return [...dx7PackedVoices[patchIndex]];
+    const voice = Array.from({ length: 128 }, (_, index) => p[`dx7v${index}`]);
+    return voice.every((value) => Number.isFinite(value)) ? voice.map((value) => Math.max(0, Math.min(127, Math.round(value)))) : undefined;
+  }
+
+  private createParamsFromPackedVoice(p: Record<string, number>, voice: number[]): Dx7Params {
+    const algorithm = Math.max(1, Math.min(32, Math.round(p.algorithm ?? ((voice[110] & 31) + 1))));
+    const feedback = Math.max(0, Math.min(7, Math.round((p.feedback ?? ((voice[111] & 7) / 7)) * 7)));
+    const width = p.width ?? 0.45;
+    return {
+      algorithm,
+      feedback,
+      fbRatio: Math.pow(2, feedback - 7),
+      lfoSpeed: voice[112] ?? 35,
+      lfoDelay: voice[113] ?? 0,
+      lfoPitchModDepth: voice[114] ?? 0,
+      lfoAmpModDepth: voice[115] ?? 0,
+      lfoPitchModSens: voice[117] & 7,
+      lfoWaveform: (voice[116] >> 1) & 7,
+      lfoSync: voice[116] & 1,
+      pitchEnvelope: { rates: voice.slice(102, 106), levels: voice.slice(106, 110) },
+      controllerModVal: 0,
+      aftertouchEnabled: 0,
+      operators: Array.from({ length: 6 }, (_, idx) => this.makeOperatorFromPackedVoice(idx, voice, width, p))
+    };
+  }
+
+  private makeOperatorFromPackedVoice(idx: number, voice: number[], width: number, p: Record<string, number>): Dx7Operator {
+    const sourceOffset = (5 - idx) * 17;
+    const rates = voice.slice(sourceOffset, sourceOffset + 4);
+    const levels = voice.slice(sourceOffset + 4, sourceOffset + 8);
+    const packedScalingAndDetune = voice[sourceOffset + 12] ?? 0;
+    const packedSensitivity = voice[sourceOffset + 13] ?? 0;
+    const volume = this.levelToDx((p[`op${idx + 1}`] ?? ((voice[sourceOffset + 14] ?? 0) / 99)) * 99);
+    const pan = (idx % 2 === 0 ? -1 : 1) * width * 32;
+    const coarse = (voice[sourceOffset + 15] ?? 1) & 31;
+    const fine = voice[sourceOffset + 16] ?? 0;
+    const oscMode = ((voice[sourceOffset + 15] ?? 0) >> 6) & 1;
+    const op: Dx7Operator = {
+      idx,
+      enabled: volume > 0,
+      rates,
+      levels,
+      detune: ((packedScalingAndDetune >> 3) & 15) - 7,
+      velocitySens: (packedSensitivity >> 2) & 7,
+      lfoAmpModSens: packedSensitivity & 3,
+      volume,
+      oscMode: oscMode === 1 ? 1 : 0,
+      freqCoarse: coarse,
+      freqFine: fine,
+      pan,
+      outputLevel: dxVoice.mapOutputLevel(volume),
+      ampL: Math.cos(Math.PI / 2 * (pan + 50) / 100),
+      ampR: Math.sin(Math.PI / 2 * (pan + 50) / 100)
+    };
+    if (op.oscMode === 0) {
+      op.freqRatio = (op.freqCoarse || 0.5) * (1 + op.freqFine / 100);
+    } else {
+      op.freqFixed = Math.pow(10, op.freqCoarse % 4) * (1 + (op.freqFine / 99) * 8.772);
+    }
+    return op;
   }
 }

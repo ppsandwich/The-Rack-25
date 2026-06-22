@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Download, FileUp, Info, KeyboardMusic, Piano, Power, Save, Settings, SlidersHorizontal, VolumeX } from "lucide-react";
+import { Download, FileUp, Info, KeyboardMusic, Piano, Save, Settings, SlidersHorizontal, VolumeX } from "lucide-react";
 import { RackAudio } from "./audio/RackAudio";
 import { builtInPresets, engines, getDefaultPreset } from "./data/engineCatalog";
 import { loadUserPresets, makeUserPreset, saveUserPresets, validateImportedPreset } from "./storage/presets";
@@ -17,7 +17,7 @@ type MidiAccess = {
 };
 
 const KEYBOARD_MAP: Record<string, number> = {
-  a: 60, w: 61, s: 62, e: 63, d: 64, f: 65, t: 66, g: 67, y: 68, h: 69, u: 70, j: 71, k: 72, o: 73, l: 74, p: 75, ";": 76
+  a: 43, w: 44, s: 45, e: 46, d: 47, f: 48, t: 49, g: 50, y: 51, h: 52, j: 53, u: 54, k: 55, o: 56, l: 57, p: 58, ";": 59
 };
 
 const defaultEffects: GlobalEffects = { tone: 0, chorus: 0.1, delay: 0.08, delayTime: 0.24, delayFeedback: 0.22, reverb: 0.18, reverbSize: 0.4, master: 0.72 };
@@ -40,10 +40,13 @@ function App() {
   const [tag, setTag] = useState("All");
   const [dirty, setDirty] = useState(false);
   const [activeNotes, setActiveNotes] = useState<Set<number>>(new Set());
+  const [octaveShift, setOctaveShift] = useState(0);
   const [midiStatus, setMidiStatus] = useState("MIDI not connected");
   const [showSettings, setShowSettings] = useState(false);
   const [showCredits, setShowCredits] = useState(false);
   const [toast, setToast] = useState("");
+  const soundingNotes = useRef(new Map<number, number>());
+  const booted = useRef(false);
 
   const presetsForEngine = useMemo(() => [...builtInPresets, ...userPresets].filter((item) => item.engineId === engine.id && item.name.toLowerCase().includes(presetQuery.toLowerCase())), [engine.id, presetQuery, userPresets]);
   const visibleEngines = useMemo(() => engines.filter((item) => (tag === "All" || item.tags.includes(tag)) && item.name.toLowerCase().includes(engineQuery.toLowerCase())), [engineQuery, tag]);
@@ -59,6 +62,21 @@ function App() {
   useEffect(() => saveUserPresets(userPresets), [userPresets]);
 
   useEffect(() => {
+    if (booted.current) return;
+    booted.current = true;
+    let cancelled = false;
+    audio.current.start()
+      .then(() => audio.current.setEngine(engine, params))
+      .catch((error) => console.warn("Rack-25 could not initialize audio on load.", error))
+      .finally(() => {
+        if (!cancelled) setReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const down = (event: KeyboardEvent) => {
       if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
@@ -66,7 +84,7 @@ function App() {
       const note = KEYBOARD_MAP[event.key.toLowerCase()];
       if (note === undefined) return;
       event.preventDefault();
-      playNote(note);
+      playNote(note, 0.86, true);
     };
     const up = (event: KeyboardEvent) => {
       const note = KEYBOARD_MAP[event.key.toLowerCase()];
@@ -78,12 +96,12 @@ function App() {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [ready]);
+  }, [ready, octaveShift]);
 
   useEffect(() => {
     const nav = navigator as Navigator & { requestMIDIAccess?: () => Promise<MidiAccess> };
     if (!nav.requestMIDIAccess) {
-      setMidiStatus("MIDI unavailable in this browser");
+      setMidiStatus("MIDI unavailable");
       return;
     }
     nav.requestMIDIAccess().then((access) => {
@@ -104,12 +122,6 @@ function App() {
       update();
     }).catch(() => setMidiStatus("MIDI permission denied"));
   }, [ready]);
-
-  const wake = async () => {
-    await audio.current.start();
-    await audio.current.setEngine(engine, params);
-    setReady(true);
-  };
 
   const selectEngine = async (next: EngineDefinition) => {
     if (dirty && !window.confirm("Switch engines and lose these tweaks?")) return;
@@ -139,30 +151,18 @@ function App() {
     setDirty(true);
   };
 
-  const setMacro = (id: string, value: number) => {
-    const macro = engine.macros.find((item) => item.id === id);
-    setMacros((current) => ({ ...current, [id]: value }));
-    if (macro) {
-      setParams((current) => {
-        const next = { ...current };
-        macro.parameterIds.forEach((paramId) => {
-          const def = engine.parameters.find((param) => param.id === paramId);
-          if (def) next[paramId] = Number((def.min + (def.max - def.min) * value).toFixed(4));
-        });
-        return next;
-      });
-    }
-    setDirty(true);
-  };
-
-  const playNote = (note: number, velocity = 0.86) => {
+  const playNote = async (note: number, velocity = 0.86, useOctaveShift = false) => {
     if (!ready) return;
-    audio.current.noteOn(note, velocity);
+    await audio.current.start();
+    const soundingNote = Math.max(0, Math.min(127, note + (useOctaveShift ? octaveShift * 12 : 0)));
+    soundingNotes.current.set(note, soundingNote);
+    await audio.current.noteOn(soundingNote, velocity);
     setActiveNotes((current) => new Set(current).add(note));
   };
 
   const stopNote = (note: number) => {
-    audio.current.noteOff(note);
+    audio.current.noteOff(soundingNotes.current.get(note) ?? note);
+    soundingNotes.current.delete(note);
     setActiveNotes((current) => {
       const next = new Set(current);
       next.delete(note);
@@ -172,7 +172,15 @@ function App() {
 
   const panic = () => {
     audio.current.allNotesOff();
+    soundingNotes.current.clear();
     setActiveNotes(new Set());
+  };
+
+  const shiftOctave = (direction: number) => {
+    audio.current.allNotesOff();
+    soundingNotes.current.clear();
+    setActiveNotes(new Set());
+    setOctaveShift((current) => Math.max(-2, Math.min(2, current + direction)));
   };
 
   const savePreset = () => {
@@ -215,24 +223,10 @@ function App() {
 
   return (
     <main className="app">
-      {!ready && (
-        <div className="wake">
-          <div>
-            <h1>Wake the rack</h1>
-            <p>Browsers are shy about audio. Tap once and we'll plug the little beast in.</p>
-            <button className="primary" onClick={wake}><Power size={18} /> Start playing</button>
-          </div>
-        </div>
-      )}
-
       <header className="topbar">
-        <div>
+        <div className="brand">
+          <img src="/rack-25-icon.svg" alt="" aria-hidden="true" />
           <strong>The Rack-25</strong>
-          <span>Twenty-five little sound machines. One warm wooden rack.</span>
-        </div>
-        <div className="now">
-          <b>{engine.name}</b>
-          <small>{preset.name}{dirty ? " *" : ""}</small>
         </div>
         <div className="status">
           <span><KeyboardMusic size={16} /> Computer keys on</span>
@@ -255,29 +249,18 @@ function App() {
               <button key={item.id} className={item.id === engine.id ? "engine active" : "engine"} onClick={() => selectEngine(item)}>
                 <b>{item.name}</b>
                 <span>{item.description}</span>
-                <small>{item.family} · {item.cpu} CPU · {item.playMode}</small>
               </button>
             ))}
           </div>
         </aside>
 
         <section className="center">
-          <div className="macro-strip">
-            {engine.macros.map((macro) => (
-              <label key={macro.id} className="macro">
-                <span>{macro.label}</span>
-                <input type="range" min="0" max="1" step="0.01" value={macros[macro.id] ?? 0.5} onChange={(e) => setMacro(macro.id, Number(e.target.value))} />
-                <small>{Math.round((macros[macro.id] ?? 0) * 100)}</small>
-              </label>
-            ))}
-          </div>
-
           <div className="panel-head">
             <div>
               <h2>{engine.name}</h2>
               <p>{engine.description}</p>
             </div>
-            <button className="primary" onClick={savePreset}><Save size={16} /> Save preset</button>
+            <button className="primary save-preset" onClick={savePreset}><Save size={16} /> Save preset</button>
           </div>
 
           <div className="params">
@@ -302,7 +285,6 @@ function App() {
               <div key={item.id} className={item.id === preset.id ? "preset active" : "preset"}>
                 <button onClick={() => loadPreset(item)}>
                   <b>{item.name}</b>
-                  <span>{item.author} · {item.tags.join(", ")}</span>
                 </button>
                 {item.source === "user" && <button className="icon" title="Delete preset" onClick={() => deletePreset(item.id)}>×</button>}
               </div>
@@ -317,7 +299,7 @@ function App() {
         </aside>
       </section>
 
-      <PianoRoll activeNotes={activeNotes} playNote={playNote} stopNote={stopNote} />
+      <PianoRoll activeNotes={activeNotes} octaveShift={octaveShift} shiftOctave={shiftOctave} playNote={playNote} stopNote={stopNote} />
 
       <footer className="foot">
         <span>{engines.length} engines · {builtInPresets.length} built-in presets · zero API routes</span>
@@ -387,29 +369,66 @@ function slugGroup(group: string) {
   return group.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
 
-function PianoRoll({ activeNotes, playNote, stopNote }: { activeNotes: Set<number>; playNote: (note: number) => void; stopNote: (note: number) => void }) {
-  const notes = Array.from({ length: 25 }, (_, i) => 48 + i);
+function PianoRoll({ activeNotes, octaveShift, shiftOctave, playNote, stopNote }: { activeNotes: Set<number>; octaveShift: number; shiftOctave: (direction: number) => void; playNote: (note: number, velocity?: number, useOctaveShift?: boolean) => void; stopNote: (note: number) => void }) {
+  const notes = Array.from({ length: 25 }, (_, i) => 36 + i);
   const whiteNotes = notes.filter((note) => !noteNames[note % 12].includes("#"));
+  const dragNote = useRef<number | null>(null);
   let whiteIndex = -1;
+  const noteFromPoint = (x: number, y: number) => {
+    const key = document.elementsFromPoint(x, y).find((element) => element instanceof HTMLElement && element.matches(".keybed button")) as HTMLButtonElement | undefined;
+    const note = Number(key?.dataset.note);
+    return Number.isFinite(note) ? note : undefined;
+  };
+  const playDragNote = (note: number | undefined) => {
+    if (note === undefined || note === dragNote.current) return;
+    if (dragNote.current !== null) stopNote(dragNote.current);
+    dragNote.current = note;
+    playNote(note, 0.86, true);
+  };
+  const releaseDrag = () => {
+    if (dragNote.current !== null) stopNote(dragNote.current);
+    dragNote.current = null;
+  };
   return (
-    <div className="keybed">
-      {notes.map((note) => {
-        const black = noteNames[note % 12].includes("#");
-        if (!black) whiteIndex += 1;
-        const left = black ? `${(whiteIndex + 1) * (100 / whiteNotes.length)}%` : undefined;
-        return (
-          <button
-            key={note}
-            className={`${black ? "black" : "white"} ${activeNotes.has(note) ? "down" : ""}`}
-            style={black ? ({ "--key-left": left } as React.CSSProperties) : undefined}
-            onPointerDown={(e) => { (e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId); playNote(note); }}
-            onPointerUp={() => stopNote(note)}
-            onPointerCancel={() => stopNote(note)}
-          >
-            <span>{noteLabel(note)}</span>
-          </button>
-        );
-      })}
+    <div className="keybed-panel">
+      <div
+        className="keybed"
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          playDragNote(noteFromPoint(event.clientX, event.clientY));
+        }}
+        onPointerMove={(event) => {
+          if (dragNote.current === null) return;
+          playDragNote(noteFromPoint(event.clientX, event.clientY));
+        }}
+        onPointerUp={releaseDrag}
+        onPointerCancel={releaseDrag}
+        onPointerLeave={(event) => {
+          if (event.buttons === 0) releaseDrag();
+        }}
+      >
+        {notes.map((note) => {
+          const black = noteNames[note % 12].includes("#");
+          if (!black) whiteIndex += 1;
+          const left = black ? `${(whiteIndex + 1) * (100 / whiteNotes.length)}%` : undefined;
+          return (
+            <button
+              key={note}
+              data-note={note}
+              className={`${black ? "black" : "white"} ${activeNotes.has(note) ? "down" : ""}`}
+              style={black ? ({ "--key-left": left } as React.CSSProperties) : undefined}
+            >
+              <span>{noteLabel(note)}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="octave-controls" aria-label="Octave shift controls">
+        <button onClick={() => shiftOctave(-1)} disabled={octaveShift <= -2}>Oct -</button>
+        <span>Octave {octaveShift > 0 ? `+${octaveShift}` : octaveShift}</span>
+        <button onClick={() => shiftOctave(1)} disabled={octaveShift >= 2}>Oct +</button>
+      </div>
     </div>
   );
 }

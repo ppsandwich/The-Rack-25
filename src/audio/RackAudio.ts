@@ -1,5 +1,6 @@
 import type { EngineDefinition, GlobalEffects } from "../types";
 import type { Dx7RackEngine } from "./Dx7RackEngine";
+import type { SmplrRackEngine } from "./SmplrRackEngine";
 import type { TinyGmRackEngine } from "./TinyGmRackEngine";
 import type { ToneRackEngine } from "./ToneRackEngine";
 
@@ -32,6 +33,7 @@ export class RackAudio {
   private dx7?: Dx7RackEngine;
   private tinyGm?: TinyGmRackEngine;
   private toneEngine?: ToneRackEngine;
+  private smplrEngine?: SmplrRackEngine;
   private engineLoad?: Promise<void>;
   private engineLoadId = 0;
   private heldNotes = new Set<number>();
@@ -43,7 +45,10 @@ export class RackAudio {
   }
 
   async start() {
-    if (this.context) return;
+    if (this.context) {
+      if (this.context.state === "suspended") void this.context.resume().catch(() => undefined);
+      return;
+    }
     const AudioCtor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     this.context = new AudioCtor();
     this.master = this.context.createGain();
@@ -68,7 +73,7 @@ export class RackAudio {
     this.delay.connect(this.delayWet).connect(this.master);
     this.convolver.connect(this.reverbWet).connect(this.master);
     this.applyEffects(this.effects);
-    await this.context.resume();
+    void this.context.resume().catch(() => undefined);
   }
 
   async setEngine(engine: EngineDefinition, params: Record<string, number>) {
@@ -77,9 +82,11 @@ export class RackAudio {
     this.dx7?.dispose();
     this.tinyGm?.dispose();
     this.toneEngine?.dispose();
+    this.smplrEngine?.dispose();
     this.dx7 = undefined;
     this.tinyGm = undefined;
     this.toneEngine = undefined;
+    this.smplrEngine = undefined;
     this.engine = engine;
     this.params = params;
     this.engineLoad = this.loadExternalEngine(loadId, engine).catch((error) => {
@@ -93,6 +100,7 @@ export class RackAudio {
     this.dx7?.update(params);
     this.tinyGm?.update(params);
     this.toneEngine?.update(params);
+    this.smplrEngine?.update(params);
   }
 
   applyEffects(effects: GlobalEffects) {
@@ -112,20 +120,32 @@ export class RackAudio {
   async noteOn(note: number, velocity = 0.85) {
     if (!this.context || !this.engine || !this.dry || !this.delay || !this.convolver) return;
     this.heldNotes.add(note);
+    let releasedBeforeLoad = false;
     if (this.engineLoad) {
       await this.engineLoad;
-      if (!this.heldNotes.has(note)) return;
+      releasedBeforeLoad = !this.heldNotes.has(note);
     }
+    const releaseIfStale = () => {
+      if (releasedBeforeLoad && this.engine?.playMode !== "drum-map") window.setTimeout(() => this.noteOff(note), 30);
+    };
     if (this.dx7) {
       this.dx7.noteOn(note, velocity);
+      releaseIfStale();
       return;
     }
     if (this.tinyGm) {
       this.tinyGm.noteOn(note, velocity);
+      releaseIfStale();
       return;
     }
     if (this.toneEngine) {
       this.toneEngine.noteOn(note, velocity);
+      releaseIfStale();
+      return;
+    }
+    if (this.smplrEngine) {
+      this.smplrEngine.noteOn(note, velocity);
+      releaseIfStale();
       return;
     }
     if (this.engine.playMode === "mono") this.allNotesOff();
@@ -133,6 +153,7 @@ export class RackAudio {
     const list = this.voices.get(note) ?? [];
     list.push(voice);
     this.voices.set(note, list);
+    releaseIfStale();
   }
 
   noteOff(note: number) {
@@ -149,6 +170,10 @@ export class RackAudio {
       this.toneEngine.noteOff(note);
       return;
     }
+    if (this.smplrEngine) {
+      this.smplrEngine.noteOff(note);
+      return;
+    }
     const voices = this.voices.get(note);
     if (!voices) return;
     voices.forEach((voice) => voice.stop());
@@ -160,27 +185,33 @@ export class RackAudio {
     this.dx7?.allNotesOff();
     this.tinyGm?.allNotesOff();
     this.toneEngine?.allNotesOff();
+    this.smplrEngine?.allNotesOff();
     this.voices.forEach((voices) => voices.forEach((voice) => voice.stop(0.01)));
     this.voices.clear();
   }
 
   private async loadExternalEngine(loadId: number, engine: EngineDefinition) {
     if (!this.context) return;
-    if (engine.id === "dx-stack" || engine.id === "cartridge-fm") {
+    if (engine.id === "dx-stack") {
       const { Dx7RackEngine } = await import("./Dx7RackEngine");
       if (loadId !== this.engineLoadId || !this.context) return;
-      this.dx7 = new Dx7RackEngine(this.context, this.params, engine.id);
+      this.dx7 = new Dx7RackEngine(this.context, this.params);
       this.route(this.dx7.output);
     } else if (engine.id === "tiny-gm") {
       const { TinyGmRackEngine } = await import("./TinyGmRackEngine");
       if (loadId !== this.engineLoadId || !this.context) return;
       this.tinyGm = new TinyGmRackEngine(this.context, this.params);
       this.route(this.tinyGm.output);
-    } else if (engine.id === "warm-analog" || engine.id === "fm-bells" || engine.id === "drum-synth-kit") {
+    } else if (["warm-analog", "soft-poly", "mono-furnace", "classic-ob", "fm-bells", "chip-arcade", "drum-synth-kit", "karplus-pluck", "modal-mallets", "open-piano", "granular-cloud", "formant-vox", "byte-crusher"].includes(engine.id)) {
       const { ToneRackEngine } = await import("./ToneRackEngine");
       if (loadId !== this.engineLoadId || !this.context) return;
-      this.toneEngine = new ToneRackEngine(this.context, this.params, engine.id);
+      this.toneEngine = new ToneRackEngine(this.context, this.params, engine.id as ConstructorParameters<typeof ToneRackEngine>[2]);
       this.route(this.toneEngine.output);
+    } else if (engine.id === "sampled-keys" || engine.id === "soundfont-rack") {
+      const { SmplrRackEngine } = await import("./SmplrRackEngine");
+      if (loadId !== this.engineLoadId || !this.context) return;
+      this.smplrEngine = new SmplrRackEngine(this.context, this.params, engine.id);
+      this.route(this.smplrEngine.output);
     }
   }
 

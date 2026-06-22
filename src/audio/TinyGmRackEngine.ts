@@ -61,6 +61,7 @@ export class TinyGmRackEngine {
   }
 
   private programFromParams(parameters: Record<string, number>) {
+    if (Number.isFinite(parameters.gmProgram)) return Math.max(0, Math.min(127, Math.round(parameters.gmProgram)));
     const shape = parameters.shape ?? 0.45;
     const bite = parameters.bite ?? 0.2;
     const motion = parameters.motion ?? 0.25;

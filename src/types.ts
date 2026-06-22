@@ -92,6 +92,9 @@ export type Preset = {
   parameters: Record<string, number>;
   macros: Record<string, number>;
   favourite?: boolean;
+  sourceUrl?: string;
+  sourceBank?: string;
+  sourceSlot?: number;
   createdAt?: string;
   updatedAt?: string;
 };
